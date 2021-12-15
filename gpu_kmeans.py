@@ -63,20 +63,42 @@ class GPU:
                     }
                 }
             }
+            
+            __global__ void sum_shared(float* A, float* C, int* Y, int n, int m, int k,int* count){
+                // for the shared memory, 1st index is for block size, 2nd index for feature number
+                __shared__ float data[512][8];
+                int tid = threadIdx.x;
+                int i = blockIdx.x * blockDim.x + threadIdx.x;
+                if(i < n && Y[i] == k){
+                    atomicAdd(&(count[k]),1);
+                    for (int a=0;a<m;a++){
+                        data[tid][a] = A[i * m + a];
+                    }
+                }
+                else{
+                    for (int a=0;a<m;a++){
+                        data[tid][a] = 0.0f;
+                    }
+                }
+                __syncthreads();
+
+                for (unsigned int stride = blockDim.x/2; stride>0; stride>>=1){
+                    if (tid < stride) {
+                        for (int a=0;a<m;a++){
+                            data[tid][a] += data[tid + stride][a];
+                        }
+                    }
+                    __syncthreads();
+                }
+
+                if (tid < m){
+                    atomicAdd(&(C[k*m + tid]),data[0][tid]);
+                    //C[k*m + tid] = data[0][tid];
+                }
+            }
                 
         """
         return SourceModule(kernelwrapper)
-
-# 加载数据
-
-def loadDataSet(fileName):  # 解析文件，按tab分割字段，得到一个浮点数字类型的矩阵
-    dataMat = []  # 文件的最后一个字段是类别标签
-    fr = open(fileName)
-    for line in fr.readlines():
-        curLine = line.strip().split('\t')
-        fltLine = map(float, curLine)  # 将每个元素转成float类型
-        dataMat.append(fltLine)
-    return dataMat
 
 
 # 计算欧几里得距离
@@ -182,7 +204,7 @@ def kMeans(dataSet, k, gpu, means, init_centroids,distMeans=distEclud):
     end = time.time()
     return centroids, clusterAssment,end - start,iter
 
-def Kmeans_gpu_integrate(dataSet, k, init_centroids):
+def Kmeans_gpu_integrate(dataSet, k, init_centroids, use_share):
     start = time.time()
     n = np.shape(dataSet)[0]
     m = np.shape(dataSet)[1]
@@ -196,7 +218,7 @@ def Kmeans_gpu_integrate(dataSet, k, init_centroids):
     C_gpu = cuda.mem_alloc(centroids.nbytes)
     Y_gpu = cuda.mem_alloc(clusterAssment.nbytes)
     count = np.zeros(k).astype(np.int32)
-    z = count.copy()
+    z = np.zeros(k).astype(np.int32)
     count_gpu = cuda.mem_alloc(count.nbytes)
     cuda.memcpy_htod(A_gpu, dataSet)
     cuda.memcpy_htod(C_gpu, centroids)
@@ -212,8 +234,15 @@ def Kmeans_gpu_integrate(dataSet, k, init_centroids):
         func2(C_gpu, np.int32(m), np.int32(k), block=(256,1,1), grid=(1,1,1))
         cuda.memcpy_htod(count_gpu, z)
 
-        func3 = mod.get_function("Sum")
-        func3(A_gpu, Y_gpu, C_gpu, count_gpu, np.int32(n), np.int32(m),np.int32(k), block=blockDim, grid=gridDim)
+        if use_share == True:
+            func3 = mod.get_function("sum_shared")
+            for cent in range(k):
+                func3(A_gpu, C_gpu, Y_gpu, np.int32(n), np.int32(m), np.int32(cent), count_gpu, block=(512, 1, 1),
+                      grid=(int(math.ceil(n / 512)), 1, 1))
+        else:
+            func3 = mod.get_function("Sum")
+            func3(A_gpu, Y_gpu, C_gpu, count_gpu, np.int32(n), np.int32(m),np.int32(k), block=blockDim, grid=gridDim)
+
 
         func4 = mod.get_function("Mean")
         func4(C_gpu, count_gpu, np.int32(m), np.int32(k), block=(32,1,1), grid=(1,1,1))
@@ -233,23 +262,28 @@ def Kmeans_gpu_integrate(dataSet, k, init_centroids):
     return centroids, clusterAssment, end - start, iter
 # --------------------测试----------------------------------------------------
 # 用测试数据及测试kmeans算法
-m = 5
-k = 5
-x = np.random.normal(loc=1, scale=2, size=(100, m))
-y = np.random.normal(loc=3, scale=1, size=(100, m))
+m = 8
+k = 8
+x = np.random.normal(loc=1, scale=2, size=(10000, m))
+y = np.random.normal(loc=3, scale=1, size=(10000, m))
 dataset = np.vstack((x,y)).astype(np.float32)
 init_centroids = randCent(dataset, k).astype(np.float32)
 inst = GPU()
 mod = inst.mod
 
 #myCentroids, clustAssign,t1,iter1 = kMeans(dataset, k, True, True, init_centroids)
-myCentroids2, clustAssign2,t2,iter2 = Kmeans_gpu_integrate(dataset, k, init_centroids)
-myCentroids, clustAssign,t3,iter3 = kMeans(dataset, k, True, False, init_centroids)
+myCentroids, clustAssign,t,iter = Kmeans_gpu_integrate(dataset, k, init_centroids,True)
+myCentroids2, clustAssign2,t2,iter2 = Kmeans_gpu_integrate(dataset, k, init_centroids,False)
+
+#myCentroids, clustAssign,t3,iter3 = kMeans(dataset, k, True, False, init_centroids)
 #myCentroids, clustAssign,t2,iter2 = kMeans(dataset, 3, False,init_centroids)
 
 start = time.time()
-cluster = KMeans(n_clusters=k,random_state=0).fit(dataset)
+cluster = KMeans(n_clusters=k,max_iter=2000,n_init = 1,init = init_centroids,algorithm="full",tol=0.00000001).fit(dataset)
 end = time.time()
-print(t2,t3,end-start)
+print(cluster.n_iter_)
+print(t,t2,end-start)
 print(myCentroids)
+print(cluster.cluster_centers_)
 print(clustAssign)
+
